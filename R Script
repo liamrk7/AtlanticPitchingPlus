@@ -1,0 +1,366 @@
+library(rsample)
+library(dplyr)
+library(lightgbm)
+library(caret)
+library(ggplot2)
+
+##Filter to only real games and remove any wildly noncompetitive pitches##
+Atlantic = Atlantic2024_2025 %>%
+  filter(PitcherTeam == "GAS" |
+           PitcherTeam == "LEX_LEG" |
+           PitcherTeam == "YOR" |
+           PitcherTeam == "LAN" | 
+           PitcherTeam == "LI" | 
+           PitcherTeam == "STA_YAN" |
+           PitcherTeam == "HAG_FLY" |
+           PitcherTeam == "HP" |
+           PitcherTeam == "SMD" |
+           PitcherTeam == "WES_POW" &
+           PitcherTeam != BatterTeam
+  ) %>%
+  mutate(PlateLocHeight = as.numeric(PlateLocHeight)) %>%
+  mutate(PlateLocSide = as.numeric(PlateLocSide)) %>%
+  filter(!is.na(PlateLocHeight)) %>% filter(PlateLocHeight > .6463 & PlateLocHeight < 4.254 & PlateLocSide > -1.708 & PlateLocSide < 1.708) %>%
+  distinct()
+
+##Create Run Values##
+set.seed(123)
+
+Atlantic_Games = Atlantic %>% group_by(Date, BatterTeam, PitcherTeam) %>% 
+  filter(!is.na(Date)) %>% summarise(
+    Runs = sum(as.numeric(RunsScored)),
+    HomeRuns = sum(PlayResult == "HomeRun"),
+    Triples = sum(PlayResult == "Triple"),
+    Doubles = sum(PlayResult == "Double"),
+    Singles = sum(PlayResult == "Single"),
+    Foul = sum(PitchCall == "FoulBall" | PitchCall == "FoulBallNotFieldable" | PitchCall == "FoulBallFieldable"),
+    HitByPitch = sum(PitchCall == "HitByPitch"),
+    FieldOut = sum(PlayResult == "Out" | PlayResult == "Sacrifice" | PlayResult == "FieldersChoice" ),
+    StrikeCalled = sum(PitchCall == "StrikeCalled"),
+    StrikeSwinging = sum(PitchCall == "StrikeSwinging"),
+    BallCalled = sum(PitchCall == "BallCalled"),
+    .groups = "drop"
+  )
+
+RunValueModel_Atlantic = lm(Runs ~ HomeRuns + Triples + Doubles + Singles + StrikeCalled + StrikeSwinging + StrikeCalled + BallCalled + Foul + HitByPitch + FieldOut + 0, data = Atlantic_Games)
+
+print(RunValueModel_Atlantic)
+
+##Add in RV + Other Useful Data##
+Atlantic = Atlantic %>%
+  filter(PitcherTeam == "GAS" |
+           PitcherTeam == "LEX_LEG" |
+           PitcherTeam == "YOR" |
+           PitcherTeam == "LAN" | 
+           PitcherTeam == "LI" | 
+           PitcherTeam == "STA_YAN" |
+           PitcherTeam == "HAG_FLY" |
+           PitcherTeam == "HP" |
+           PitcherTeam == "SMD" |
+           PitcherTeam == "WES_POW" &
+           PitcherTeam != BatterTeam
+           ) %>%
+  mutate(RunValue = case_when(
+  PlayResult == "HomeRun" ~ 1.45244,
+  PlayResult == "Triple" ~ 1.05308,
+  PlayResult == "Double" ~ .80336,
+  PlayResult == "Single" ~ .51504,
+  PitchCall == "StrikeCalled" ~ -.02520,
+  PitchCall == "BallCalled" ~ .07984,
+  PitchCall == "StrikeSwinging" ~ -.06686,
+  PitchCall == "FoulBall" ~ -.01918,
+  PitchCall == "FoulBallNotFieldable" ~ -.01918,
+  PitchCall == "FoulBallFieldable" ~ -.01918,
+  PitchCall == "HitByPitch" ~ .22168,
+  PlayResult == "Out" ~ -.10172,
+  PlayResult == "Sacrifice" ~ -.10172,
+  PlayResult == "FieldersChoice" ~ -.10172,
+  TRUE ~ NA_real_
+)) %>% mutate(SpinRate = as.numeric(SpinRate)) %>%
+  mutate(InducedVertBreak = as.numeric(InducedVertBreak)) %>%
+  mutate(HorzBreak = as.numeric(HorzBreak)) %>%
+  mutate(RelHeight = as.numeric(RelHeight)) %>%
+  mutate(RelSide = as.numeric(RelSide)) %>%
+  mutate(Extension = as.numeric(Extension)) %>%
+  mutate(PlateLocHeight = as.numeric(PlateLocHeight)) %>%
+  mutate(PlateLocSide = as.numeric(PlateLocSide)) %>%
+  mutate(PitchBucket = case_when(
+    AutoPitchType =="Four-Seam" ~ "Fastball",
+    AutoPitchType == "Sinker" ~ "Fastball",
+    AutoPitchType == "Curveball" ~ "Curveball",
+    AutoPitchType == "Slider" ~ "Slider",
+    AutoPitchType == "Changeup" ~ "OffSpeed",
+    AutoPitchType == "Splitter" ~ "OffSpeed",
+    AutoPitchType == "Cutter" ~ "Fastball",
+    TRUE ~ NA_character_
+  )) %>%
+  mutate(
+    HorzMissHeart = abs(as.numeric(PlateLocSide)),
+    VertMissHeart = abs(as.numeric(PlateLocHeight) - 2.4485415),
+    MissDistanceHeart = sqrt(HorzMissHeart^2 + VertMissHeart^2)
+  ) %>%
+  mutate(
+    HorzMissEdge = abs(abs(as.numeric(PlateLocSide)) - 0.708333),
+    VertMissEdge = pmin(
+      abs(as.numeric(PlateLocHeight) - 1.6425),
+      abs(as.numeric(PlateLocHeight) - 3.254583),
+      na.rm = TRUE
+    ),
+    MissDistanceEdge = sqrt(HorzMissEdge^2 + VertMissEdge^2)
+  ) %>%
+  mutate(
+    InZone = case_when(
+      PlateLocHeight < 3.254583 &
+        PlateLocHeight > 1.6435 &
+        PlateLocSide < 0.708333 & 
+        PlateLocSide > -0.708333 ~ 1, 
+      TRUE ~ 0
+    )) %>%
+      mutate(
+      Slot = case_when(
+        (atan2(RelHeight - 5, abs(RelSide)) * 180 / pi) > 70 ~ "OTT",
+        (atan2(RelHeight - 5, abs(RelSide)) * 180 / pi) > 30 ~ "ThreeQ",
+        (atan2(RelHeight - 5, abs(RelSide)) * 180 / pi) > -10 ~ "Side",
+        TRUE ~ "Sub"
+    )
+  ) %>% filter(!is.na(PitchBucket))
+
+##Create Player Baseline (FBs)##
+Atlantic_Fastballs = Atlantic %>%
+  filter(AutoPitchType == "Sinker" | AutoPitchType == "Four-Seam") %>%
+  group_by(PitcherTeam, Pitcher) %>% summarise(
+    FB_Velo = mean(as.numeric(RelSpeed)),
+    FB_IVB = mean(as.numeric(InducedVertBreak)),
+    FB_HB = mean(as.numeric(HorzBreak)),
+    .groups = "drop"
+  )
+
+
+##Create Armslot Baseline (By Pitch Bucket)##
+Atlantic_Slots = Atlantic %>%
+  group_by(Slot, PitchBucket) %>% summarise(
+    Bucket_Velo = mean(as.numeric(RelSpeed, na.rm = TRUE)),
+    Bucket_IVB = mean(as.numeric(InducedVertBreak, na.rm = TRUE)),
+    Bucket_HB = mean(as.numeric(HorzBreak, na.rm = TRUE)),
+    .groups = "drop"
+  )
+
+Atlantic = merge(Atlantic, Atlantic_Fastballs, by = c("PitcherTeam", "Pitcher"))
+Atlantic = merge(Atlantic, Atlantic_Slots, by = c("Slot", "PitchBucket"))
+
+Atlantic = Atlantic %>% mutate(
+  Velo_Dif_FB = FB_Velo - RelSpeed,
+  IVB_Dif_FB = FB_IVB - InducedVertBreak,
+  HB_Dif_FB = abs(FB_HB) - abs(HorzBreak),
+  Velo_Dif_Bucket = Bucket_Velo - RelSpeed,
+  IVB_Dif_Bucket = Bucket_IVB - InducedVertBreak,
+  HB_Dif_Bucket = abs(Bucket_HB) - abs(HorzBreak),
+)
+
+Atlantic_All = Atlantic
+
+##Create Train and Test Data##
+Split = initial_split(Atlantic_All, prop = 0.8)
+
+Atlantic = training(Split)
+Atlantic_Test  = testing(Split)
+
+##Fastballs## 
+Atlantic_Fastballs = Atlantic %>%
+  filter(PitchBucket == "Fastball") %>%
+  mutate(HorzBreak = abs(HorzBreak)) %>% mutate(RelSide = abs(RelSide))
+
+fb_predictor_vars = c("RelSpeed", "SpinRate", "InducedVertBreak", "HorzBreak", "RelHeight", "RelSide","Extension", "Velo_Dif_Bucket", "IVB_Dif_Bucket", "HB_Dif_Bucket", "MissDistanceHeart", "MissDistanceEdge")
+complete_rows = complete.cases(Atlantic_Fastballs[, fb_predictor_vars])
+
+X = as.matrix(Atlantic_Fastballs[complete_rows, fb_predictor_vars])
+y = Atlantic_Fastballs$RunValue[complete_rows]
+
+dtrain <- lgb.Dataset(data = X, label = y)
+
+params = list(
+  objective = "regression",
+  metric = "rmse",
+  learning_rate = 0.1,
+  num_leaves = 31
+)
+
+fb_model_atl = lgb.train(
+  params = params,
+  data = dtrain,
+  nrounds = 100
+)
+
+saveRDS(fb_model_atl, "fb_model_atl.rds")
+
+predictions <- predict(fb_model_atl, X)
+
+Atlantic_Fastballs$Predicted_RunValue = NA
+
+Atlantic_Fastballs$Predicted_RunValue[complete_rows] = predictions
+
+rmse = sqrt(mean((Atlantic_Fastballs$Predicted_RunValue - Atlantic_Fastballs$RunValue)^2, na.rm = TRUE))
+print(rmse)
+
+
+##OffSpeed##
+Atlantic_OffSpeed = Atlantic %>% filter(PitchBucket == "OffSpeed") %>% mutate(HorzBreak = abs(HorzBreak)) %>% mutate(RelSide = abs(RelSide))
+
+predictor_vars = c("RelSpeed", "SpinRate", "InducedVertBreak", "HorzBreak", "RelHeight", "RelSide","Extension", "Velo_Dif_FB", "IVB_Dif_FB", "HB_Dif_FB", "Velo_Dif_Bucket", "IVB_Dif_Bucket", "HB_Dif_Bucket", "MissDistanceHeart", "MissDistanceEdge")
+complete_rows = complete.cases(Atlantic_OffSpeed[, predictor_vars])
+
+X = as.matrix(Atlantic_OffSpeed[complete_rows, predictor_vars])
+y = Atlantic_OffSpeed$RunValue[complete_rows]
+
+dtrain = lgb.Dataset(data = X, label = y)
+
+params = list(
+  objective = "regression",
+  metric = "rmse",
+  learning_rate = 0.1,
+  num_leaves = 31
+)
+
+off_model_atl = lgb.train(
+  params = params,
+  data = dtrain,
+  nrounds = 100
+)
+
+saveRDS(off_model_atl, "off_model_atl.rds")
+
+predictions = predict(off_model_atl, X)
+
+Atlantic_OffSpeed$Predicted_RunValue = NA
+
+Atlantic_OffSpeed$Predicted_RunValue[complete_rows] = predictions
+
+rmse = sqrt(mean((Atlantic_OffSpeed$Predicted_RunValue - Atlantic_OffSpeed$RunValue)^2, na.rm = TRUE))
+print(rmse)
+
+##Slider##
+Atlantic_Slider = Atlantic %>% filter(PitchBucket == "Slider") %>% mutate(HorzBreak = abs(HorzBreak)) %>% mutate(RelSide = abs(RelSide))
+
+predictor_vars = c("RelSpeed", "SpinRate", "InducedVertBreak", "HorzBreak", "RelHeight", "RelSide","Extension", "Velo_Dif_FB", "IVB_Dif_FB", "HB_Dif_FB", "Velo_Dif_Bucket", "IVB_Dif_Bucket", "HB_Dif_Bucket", "MissDistanceHeart", "MissDistanceEdge")
+complete_rows = complete.cases(Atlantic_Slider[, predictor_vars])
+
+X = as.matrix(Atlantic_Slider[complete_rows, predictor_vars])
+y = Atlantic_Slider$RunValue[complete_rows]
+
+dtrain = lgb.Dataset(data = X, label = y)
+
+params = list(
+  objective = "regression",
+  metric = "rmse",
+  learning_rate = 0.1,
+  num_leaves = 31
+)
+
+sl_model_atl = lgb.train(
+  params = params,
+  data = dtrain,
+  nrounds = 100
+)
+
+saveRDS(sl_model_atl, "sl_model_atl.rds")
+
+predictions = predict(sl_model_atl, X)
+
+Atlantic_Slider$Predicted_RunValue = NA
+
+Atlantic_Slider$Predicted_RunValue[complete_rows] = predictions
+
+rmse = sqrt(mean((Atlantic_Slider$Predicted_RunValue - Atlantic_Slider$RunValue)^2, na.rm = TRUE))
+print(rmse)
+
+##Curveball##
+Atlantic_Curveball = Atlantic %>% filter(PitchBucket == "Curveball") %>% mutate(HorzBreak = abs(HorzBreak)) %>% mutate(RelSide = abs(RelSide))
+
+predictor_vars = c("RelSpeed", "SpinRate", "InducedVertBreak", "HorzBreak", "RelHeight", "RelSide","Extension", "Velo_Dif_FB", "IVB_Dif_FB", "HB_Dif_FB", "Velo_Dif_Bucket", "IVB_Dif_Bucket", "HB_Dif_Bucket", "MissDistanceHeart", "MissDistanceEdge")
+complete_rows = complete.cases(Atlantic_Curveball[, predictor_vars])
+
+X = as.matrix(Atlantic_Curveball[complete_rows, predictor_vars])
+y = Atlantic_Curveball$RunValue[complete_rows]
+
+dtrain = lgb.Dataset(data = X, label = y)
+
+params = list(
+  objective = "regression",
+  metric = "rmse",
+  learning_rate = 0.1,
+  num_leaves = 31
+)
+
+cb_model_atl = lgb.train(
+  params = params,
+  data = dtrain,
+  nrounds = 100
+)
+
+saveRDS(cb_model_atl, "cb_model_atl.rds")
+
+predictions = predict(cb_model_atl, X)
+
+Atlantic_Curveball$Predicted_RunValue = NA
+
+Atlantic_Curveball$Predicted_RunValue[complete_rows] = predictions
+
+rmse = sqrt(mean((Atlantic_Curveball$Predicted_RunValue - Atlantic_Curveball$RunValue)^2, na.rm = TRUE))
+print(rmse)
+
+
+predictions = predict(fb_model_atl, X)
+
+
+##Test - FBs##
+Atlantic_Fastballs_Test = Atlantic_Test %>% filter(PitchBucket == "Fastball")
+
+X_fastball = as.matrix(Atlantic_Fastballs_Test[, fb_predictor_vars])
+
+predictions = predict(fb_model_atl, X_fastball)
+
+Atlantic_Fastballs_Test$Predicted_RunValue = predictions
+
+##Test - Offs##
+Atlantic_OffSpeed_Test = Atlantic_Test %>% filter(PitchBucket == "OffSpeed")
+
+X_offspeed = as.matrix(Atlantic_OffSpeed_Test[, predictor_vars])
+
+predictions = predict(off_model_atl, X_offspeed)
+
+Atlantic_OffSpeed_Test$Predicted_RunValue = predictions
+
+##Test - SLs##
+Atlantic_Slider_Test = Atlantic_Test %>% filter(PitchBucket == "Slider")
+
+X_slider = as.matrix(Atlantic_Slider_Test[, predictor_vars])
+
+predictions = predict(sl_model_atl, X_slider)
+
+Atlantic_Slider_Test$Predicted_RunValue = predictions
+
+##Test - CBs##
+Atlantic_Curveball_Test = Atlantic_Test %>% filter(PitchBucket == "Curveball")
+
+X_curveball = as.matrix(Atlantic_Curveball_Test[, predictor_vars])
+
+predictions = predict(off_model_atl, X_curveball)
+
+Atlantic_Curveball_Test$Predicted_RunValue = predictions
+
+Atlantic_Test_2 = rbind(Atlantic_Fastballs_Test, Atlantic_OffSpeed_Test, Atlantic_Curveball_Test, Atlantic_Slider_Test)
+
+Atlantic_Stuff = Atlantic_Test_2 %>% group_by(Pitcher, AutoPitchType) %>% summarise(
+  Pitches = n(),
+  Stuff = 100 + ((0.04096 - mean(Predicted_RunValue)) / 0.0312321 * 50),
+  RunValue = mean(RunValue, na.rm = TRUE)
+) %>% filter(Pitches > 19) %>% filter(!is.na(Pitcher)) %>% filter(Stuff < 150 & Stuff > 50)
+
+ggplot(Atlantic_Stuff) +
+  geom_point(aes(x = Stuff, y = RunValue, color = AutoPitchType), 
+             size = 2, alpha = 1, na.rm = TRUE) +
+  labs(title = "Pitching+ v Run Value") +
+  
+  theme(legend.position = "bottom", 
+        panel.grid.major = element_line(colour = "grey70"), 
+        panel.grid.minor = element_line(colour = "grey80"))
